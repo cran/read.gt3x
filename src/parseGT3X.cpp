@@ -1,8 +1,10 @@
+#define STRICT_R_HEADERS
 #include <Rcpp.h>
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <sstream>
+#include <cfloat>
 
 using namespace Rcpp;
 using namespace std;
@@ -104,7 +106,7 @@ double decodeFloatParameterValue(const uint32_t value) {
 
 // saves the start time from log.bin parameters and prints all of the parameters (if verbose = true)
 // ref: https://github.com/actigraph/GT3X-File-Format/blob/master/LogRecords/Parameters.md
-void ParseParameters(ifstream& stream, int bytes, uint32_t& start_time, bool verbose) {
+void ParseParameters(ifstream& stream, int bytes, uint32_t& start_time, bool verbose, uint32_t& features) {
   // The record payload is of variable length consisting of 8-byte key/value pairs.
   int n_params = bytes / 8;
   uint16_t address;
@@ -130,9 +132,15 @@ void ParseParameters(ifstream& stream, int bytes, uint32_t& start_time, bool ver
         decoded_value = decodeFloatParameterValue(value);
         if(verbose)
           Rcout << " value: " << decoded_value << "\n";
+        // all_params.push_back(Rcpp::as<std::string>(decoded_value));
+
       }
-      else if(verbose)
-        Rcout <<  " value: " << value << "\n";
+      else {
+        if(verbose)
+          Rcout <<  " value: " << value << "\n";
+        // all_params = value;
+      }
+
     }
 
     else if(address == 1) {
@@ -140,9 +148,19 @@ void ParseParameters(ifstream& stream, int bytes, uint32_t& start_time, bool ver
         start_time = (uint32_t)value;
         if(verbose)
           Rcout << " (start time) ";
+        // all_params.push_back("start time");
+        // all_params.push_back(Rcpp::as<std::string>(start_time));
+      }
+      if(key == 2) { // features
+        features = (uint32_t)value;
+        if(verbose)
+          Rcout << " (features) ";
+        // all_params.push_back("features");
+        // all_params.push_back(Rcpp::as<std::string>(features));
       }
       if(verbose)
         Rcout <<  " value: " << value << "\n";
+
     }
   }
   if(verbose)
@@ -303,6 +321,8 @@ int bytes2samplesize(uint8_t& type, uint16_t& bytes) {
 //' @param scale_factor Scale factor for the activity samples.
 //' @param sample_rate sampling rate for activity samples.
 //' @param start_time starting time of the sample recording.
+//' @param batch_begin first second in time relative to start of raw non-imputed recording to include in this batch
+//' @param batch_end last second in time relative to start of raw non-imputed recording to include in this batch
 //' @param verbose Print the parameters from the log.bin file and other messages?
 //' @param impute_zeroes Impute zeros in case there are missingness?
 //' @param debug Print information for every activity second
@@ -318,6 +338,8 @@ NumericMatrix parseGT3X(const char* filename,
                         const double scale_factor,
                         const int sample_rate,
                         const uint32_t start_time,
+                        const uint32_t batch_begin = 0,
+                        const uint32_t batch_end = 0,
                         const bool verbose = false,
                         const bool debug = false,
                         const bool impute_zeroes = false) {
@@ -335,6 +357,7 @@ NumericMatrix parseGT3X(const char* filename,
   uint16_t size;
   uint32_t payload_start;
   uint32_t param_start_time;
+  uint32_t features;
   uint32_t expected_payload_start = start_time;
   int payload_timediff;
   int total_records = 0;
@@ -343,12 +366,27 @@ NumericMatrix parseGT3X(const char* filename,
   bool have_activity2 = false;
   int num_activity = 0;
   int num_activity2 = 0;
-
+  bool use_batching = false;
   int chksum;
 
-  if (debug)
+  if (debug) {
     Rcout << "Reading Stream...\n";
+  }
+
+  uint32_t batch_counter = 0;
+
+  if (batch_end > 0) {
+    use_batching = true;
+    if (batch_end < batch_begin) {
+      Rcout << "batch_begin is higher than batch_end, please check input arguments\n";
+    }
+  }
+
   while(GT3Xstream) {
+
+    if (use_batching && batch_counter >= batch_end) {
+      break;
+    }
 
     item = GT3Xstream.get();
     if(!GT3Xstream) {
@@ -378,7 +416,8 @@ NumericMatrix parseGT3X(const char* filename,
       }
 
       if(type == RECORDTYPE_PARAMETERS) {
-        ParseParameters(GT3Xstream, size, param_start_time, verbose);
+        ParseParameters(GT3Xstream, size, param_start_time, verbose, features);
+        // ParseParameters(GT3Xstream, size, param_start_time, verbose);
         if (debug) {
           Rcout << "param_start_time: " << param_start_time << "\n";
         }
@@ -399,7 +438,7 @@ NumericMatrix parseGT3X(const char* filename,
           } else {
             Missingness[patch::to_string(expected_payload_start)] = n_missing;
 
-            if(impute_zeroes) {
+            if(impute_zeroes && !use_batching) {
               ImputeZeroes(timeStamps, total_records, n_missing, sample_rate, start_time, expected_payload_start, debug);
               total_records += n_missing;
             }
@@ -422,37 +461,43 @@ NumericMatrix parseGT3X(const char* filename,
             Rcout << "max_samples: " << max_samples << "\n";
           }
           Missingness[patch::to_string(payload_start)] = sample_rate;
-          if(impute_zeroes) {
+          if(impute_zeroes && !use_batching) {
             ImputeZeroes(timeStamps, total_records, sample_rate, sample_rate, start_time, payload_start, debug);
             total_records += sample_rate;
           }
         }
 
+        if (sample_size > 0) {
 
-        if ( (type == RECORDTYPE_ACTIVITY) & (sample_size > 0) ) {
-          if ( debug & !have_activity) {
-            Rcout << "First ACTIVTY packet, sample size: " << sample_size << "\n";
-            Rcout << "ACTIVTY packet size: " << size << "\n";
+          ++batch_counter;
+          if (!use_batching || batch_counter >= batch_begin) {
+
+            if (type == RECORDTYPE_ACTIVITY) {
+              if ( debug & !have_activity) {
+                Rcout << "First ACTIVTY packet, sample size: " << sample_size << "\n";
+                Rcout << "ACTIVTY packet size: " << size << "\n";
+              }
+
+              have_activity = true;
+              num_activity = num_activity + 1;
+              ParseActivity(GT3Xstream, activityMatrix, timeStamps, total_records, sample_size, payload_start, sample_rate, start_time, debug);
+              total_records += sample_size;
+            } else if (type == RECORDTYPE_ACTIVITY2) {
+              if ( debug & !have_activity2) {
+                Rcout << "First ACTIVTY2 packet, sample size: " << sample_size << "\n";
+              }
+
+              have_activity2 = true;
+              num_activity2 = num_activity2 + 1;
+              ParseActivity2(GT3Xstream, activityMatrix, timeStamps, total_records, sample_size, payload_start, sample_rate, start_time, debug);
+              total_records += sample_size;
+            }
+          } else {
+            GT3Xstream.seekg(size, std::ios_base::cur);
           }
-          have_activity = true;
-          num_activity = num_activity + 1;
-          ParseActivity(GT3Xstream, activityMatrix, timeStamps, total_records, sample_size, payload_start, sample_rate, start_time, debug);
-          total_records += sample_size;
+
         }
-
-        else if ( (type == RECORDTYPE_ACTIVITY2) & (sample_size > 0) ) {
-          if ( debug & !have_activity2) {
-            Rcout << "First ACTIVTY2 packet, sample size: " << sample_size << "\n";
-          }
-          have_activity2 = true;
-          num_activity2 = num_activity2 + 1;
-          ParseActivity2(GT3Xstream, activityMatrix, timeStamps, total_records, sample_size, payload_start, sample_rate, start_time, debug);
-          total_records += sample_size;
-        }
-
-      }
-
-      else {
+      } else {
         GT3Xstream.seekg(size, std::ios::cur);
       }
 
@@ -473,7 +518,7 @@ NumericMatrix parseGT3X(const char* filename,
   scaleAndRoundActivity(activityMatrix, scale_factor, total_records);
 
 
-  if(!impute_zeroes) {
+  if(!impute_zeroes || use_batching) {
     if(verbose)
       Rcout << "Removing excess rows \n";
     activityMatrix =  activityMatrix(Range(0, total_records - 1), Range(0, N_ACTIVITYCOLUMNS - 1));
@@ -531,6 +576,7 @@ NumericMatrix parseGT3X(const char* filename,
   activityMatrix.attr("total_records") = total_records;
 
   activityMatrix.attr("start_time_param") = param_start_time;
+  activityMatrix.attr("features") = features;
   activityMatrix.attr("start_time_info") = start_time;
   activityMatrix.attr("sample_rate") = sample_rate;
   activityMatrix.attr("impute_zeroes") = impute_zeroes;

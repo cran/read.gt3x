@@ -1,3 +1,13 @@
+# read.gt3x 1.2.0
+
+* Added batch-reading functionality, see #40
+
+# read.gt3x 1.1.1
+
+* Added extraction of features.
+* Added `extract_gt3x_info` for allowing of passing of connections for info text files.
+
+
 # read.gt3x 1.0.2
 
 * Added timeout for `gt3x_datapath` downloading.
@@ -11,7 +21,8 @@
 
 # read.gt3x 1.0.0
 
-* Release to CRAN
+* Released to CRAN on 2021-01-07.
+* dev note: release SHA commit f23eda5
 
 # read.gt3x 0.4.2
 
